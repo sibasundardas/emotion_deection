@@ -5,6 +5,7 @@ import streamlit as st
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
 import threading
 import time
+import queue
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -29,9 +30,8 @@ face_classifier, classifier = load_assets()
 emotion_labels = ['Angry', 'Disgust', 'Fear', 'Happy', 'Neutral', 'Sad', 'Surprise']
 
 # --- Emoji Mapping ---
-# A dictionary to map emotion labels to emojis
 emotion_emojis = {
-    'Angry': '😠',
+    'Angry': '�',
     'Disgust': '🤢',
     'Fear': '😨',
     'Happy': '😊',
@@ -40,17 +40,18 @@ emotion_emojis = {
     'Surprise': '😮'
 }
 
-# --- Shared State for Emotion Prediction ---
-# This thread-safe container will hold the latest detected emotion
-lock = threading.Lock()
-latest_prediction_container = {"emotion": None}
-
-# --- Video Transformer Class ---
+# --- Video Transformer Class (with Queue for robust communication) ---
 class EmotionDetector(VideoTransformerBase):
+    def __init__(self):
+        # A thread-safe queue to hold detection results
+        self.result_queue = queue.Queue()
+
     def transform(self, frame):
         img = frame.to_ndarray(format="bgr24")
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         faces = face_classifier.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
+        
+        latest_emotion = None
 
         for (x, y, w, h) in faces:
             cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
@@ -64,14 +65,13 @@ class EmotionDetector(VideoTransformerBase):
                 
                 prediction = classifier.predict(roi)[0]
                 label = emotion_labels[prediction.argmax()]
+                latest_emotion = label # Keep track of the last detected emotion
                 
-                # Update the shared container with the latest emotion
-                with lock:
-                    latest_prediction_container["emotion"] = label
-                
-                # Draw the text label on the video frame
                 label_position = (x, y - 10)
                 cv2.putText(img, label, label_position, cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        
+        # Put the latest detected emotion into the queue
+        self.result_queue.put(latest_emotion)
         
         return img
 
@@ -87,7 +87,7 @@ else:
     webrtc_ctx = webrtc_streamer(
         key="emotion-detection",
         mode=WebRtcMode.SENDRECV,
-        video_transformer_factory=EmotionDetector,
+        video_processor_factory=EmotionDetector,
         media_stream_constraints={"video": True, "audio": False},
         async_processing=True,
     )
@@ -95,19 +95,23 @@ else:
     st.markdown("---")
     st.header("Live Emotion Status")
     
-    # Create a placeholder for the emoji and text
     emotion_placeholder = st.empty()
 
-    # Continuously update the placeholder while the video is playing
-    while webrtc_ctx.state.playing:
-        with lock:
-            emotion = latest_prediction_container["emotion"]
-        
-        if emotion:
-            emoji = emotion_emojis.get(emotion, '')
-            emotion_placeholder.markdown(f"<h2 style='text-align: center;'>{emotion} {emoji}</h2>", unsafe_allow_html=True)
-        else:
-            emotion_placeholder.markdown("<h2 style='text-align: center;'>Detecting...</h2>", unsafe_allow_html=True)
-            
-        time.sleep(0.1) # Update every 100ms
-        
+    if webrtc_ctx.video_processor:
+        while True:
+            try:
+                # Get the latest result from the queue
+                result = webrtc_ctx.video_processor.result_queue.get(timeout=1.0)
+                if result:
+                    emoji = emotion_emojis.get(result, '')
+                    emotion_placeholder.markdown(f"<h2 style='text-align: center;'>{result} {emoji}</h2>", unsafe_allow_html=True)
+                # If result is None (no face detected), we can keep the last state or show detecting
+                # For now, we do nothing to keep the last valid emotion on screen
+            except queue.Empty:
+                # If the queue is empty, it means no new frame has been processed
+                # We can break or continue based on desired behavior
+                if not webrtc_ctx.state.playing:
+                    emotion_placeholder.markdown("<h2 style='text-align: center;'>Stopped</h2>", unsafe_allow_html=True)
+                    break
+    else:
+        st.info("Click START to begin analysis.")
